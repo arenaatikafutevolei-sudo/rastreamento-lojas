@@ -6,7 +6,6 @@ import os
 import time
 import json
 import re
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
@@ -91,62 +90,10 @@ def formatar_data_br(data_str):
     except:
         return data_str
 
-def get_melhor_envio_tracking(tracking_number):
-    """
-    Consulta o rastreio no Melhor Envio (melhorrastreio.com.br)
-    Utiliza BeautifulSoup para extrair os dados da página.
-    """
-    tracking_number = str(tracking_number).strip().upper()
-    url = f"https://melhorrastreio.com.br/rastreio/{tracking_number}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extração de eventos baseada na estrutura de texto da página
-            eventos = []
-            text_content = soup.get_text(separator='\n')
-            lines = [line.strip() for line in text_content.split('\n') if line.strip()]
-            
-            for i in range(len(lines)):
-                # Procura por padrões de data como "14 abr"
-                if re.match(r'^\d+\s+[a-z]{3}$', lines[i].lower()):
-                    try:
-                        data_br = formatar_data_br(lines[i])
-                        # A hora costuma vir na linha seguinte
-                        hora = lines[i+1] if i+1 < len(lines) and re.match(r'^\d{2}:\d{2}$', lines[i+1]) else ""
-                        # O título do evento costuma vir na linha seguinte à hora (ou à data se não houver hora)
-                        offset = 2 if hora else 1
-                        titulo = lines[i+offset] if i+offset < len(lines) else "Atualização"
-                        
-                        # A descrição costuma vir logo após o título
-                        descricao = ""
-                        if i+offset+1 < len(lines) and len(lines[i+offset+1]) > 5:
-                            descricao = lines[i+offset+1]
-                        elif i+offset+2 < len(lines) and len(lines[i+offset+2]) > 5:
-                            descricao = lines[i+offset+2]
-                            
-                        full_desc = f"{titulo} - {descricao}".strip(" - ")
-                        eventos.append({
-                            "data": f"{data_br} {hora}".strip(),
-                            "descricao": full_desc
-                        })
-                    except:
-                        continue
-            
-            if eventos:
-                return {"status": eventos[0]["descricao"], "eventos": eventos}
-                
-    except Exception as e:
-        print(f"Erro ao consultar Melhor Envio: {e}")
-    return None
-
 def get_spx_tracking(tracking_number):
     """
     Extrai dados de rastreamento da SPX (V49).
+    Prioridade total com detecção aprimorada.
     """
     url = "https://spx.com.br/shipment/order/open/order/get_order_info"
     params = {"spx_tn": tracking_number, "language_code": "pt"}
@@ -160,24 +107,36 @@ def get_spx_tracking(tracking_number):
         response = requests.get(url, params=params, headers=headers, timeout=10)
         if response.status_code != 200: return None
         data = response.json()
+        
+        # Se o retcode for 2 (not found), pode ser que o código seja novo ou de outra transportadora
         if data.get("retcode") != 0: return None
+        
         sls_info = data.get("data", {}).get("sls_tracking_info", {})
         order_info = data.get("data", {}).get("order_info", {})
         records = (sls_info.get("records") or []) + (order_info.get("tracking_info") or [])
+        
         if not records: return None
+        
+        # Ordenar por tempo (mais recente primeiro)
         records = sorted(records, key=lambda x: x.get("actual_time", 0), reverse=True)
+        
         status_text = records[0].get("description") or records[0].get("seller_description") or "Em trânsito"
         eventos = []
         eventos_unicos = set()
+        
         for item in records:
+            # Removi o filtro rigoroso de display_flag para garantir que todos os eventos apareçam
             timestamp = item.get("actual_time")
             data_str = datetime.fromtimestamp(timestamp).strftime("%d/%m/%Y %H:%M") if timestamp else ""
             descricao = item.get("seller_description") or item.get("description") or item.get("buyer_description") or "Atualização"
+            
             chave = f"{data_str}-{descricao}"
             if chave not in eventos_unicos:
                 eventos_unicos.add(chave)
                 eventos.append({"data": data_str, "descricao": str(descricao)})
-        if eventos: return {"status": str(status_text), "eventos": eventos}
+        
+        if eventos:
+            return {"status": str(status_text), "eventos": eventos}
     except: pass
     return None
 
@@ -213,6 +172,7 @@ def get_superfrete_tracking(tracking_code):
                     if ev.get('unidade'): msg += f" ({ev.get('unidade')})"
                     eventos.append({"data": data_br, "descricao": msg})
                 if eventos: return {"status": status_atual, "eventos": eventos}
+            
             main_track = data.get("tracking", {})
             if main_track and main_track.get("eventos"):
                 eventos_raw = main_track.get("eventos", [])
@@ -236,7 +196,7 @@ def get_correios_tracking(tracking_number):
                 eventos = []
                 for ev in eventos_raw:
                     data_br = f"{ev.get('data')} {ev.get('hora')}"
-                    local = f"{ev.get('local')} - {ev.get('cidade')} / {ev.get('uf')}"
+                    local = f"{ev.get('local')} - {ev.get('cidade')}/{ev.get('uf')}"
                     eventos.append({"data": data_br, "descricao": f"{ev.get('status')} ({local})"})
                 return {"status": eventos[0]["descricao"], "eventos": eventos}
     except: pass
@@ -275,25 +235,20 @@ def get_cainiao_tracking_v2(tracking_number):
 def logic_unificada(codigo):
     codigo = str(codigo).strip().upper()
     
-    # 1. Melhor Envio (Novo - Prioridade para códigos ME ou LGI)
-    if "-ME" in codigo or codigo.startswith("LGI-"):
-        res_me = get_melhor_envio_tracking(codigo)
-        if res_me: return res_me
-
-    # 2. SPX (Prioridade Máxima)
+    # 1. SPX (Prioridade Máxima)
     res_spx = get_spx_tracking(codigo)
     if res_spx: return res_spx
 
-    # 3. SuperFrete (Fallback para Jadlog, Loggi, JNS e Correios)
+    # 2. SuperFrete (Fallback para Jadlog, Loggi, JNS e Correios)
     res_sf = get_superfrete_tracking(codigo)
     if res_sf: return res_sf
     
-    # 4. Correios Direto
+    # 3. Correios Direto
     if re.match(r'^[A-Z]{2}[0-9]{9}BR$', codigo):
         res_br = get_correios_tracking(codigo)
         if res_br: return res_br
     
-    # 5. Cainiao
+    # 4. Cainiao
     res_cainiao = get_cainiao_tracking_v2(codigo)
     if res_cainiao:
         novo_codigo = res_cainiao.get("novo_codigo")
@@ -306,7 +261,7 @@ def logic_unificada(codigo):
                 status_final = res_novo_br["status"]
         return {"status": status_final, "eventos": eventos_finais, "codigo_original": codigo, "novo_codigo": novo_codigo}
 
-    # 6. Loggi Redirect Fallback
+    # 5. Loggi Redirect Fallback
     if codigo.startswith("NE") or codigo.startswith("MR") or codigo.endswith("LG"):
         return {
             "status": "CÓDIGO DA LOGGI IDENTIFICADO",
@@ -326,4 +281,7 @@ def logic_unificada(codigo):
 def rastrear(codigo): return jsonify(logic_unificada(codigo))
 
 @app.route("/")
-def home(): return "API Sermente V50 (Melhor Envio Integrated) 🚚"
+def home(): return "API Sermente V49 (SPX Fixed) 🚚"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
